@@ -1,0 +1,21 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+.DS_Store
+
+# Methodology (internal)
+methodology.md
+
+# Data folder (too large for git -- download from Google Drive)
+data/
+
+# Generated visualizations
+*.html
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
