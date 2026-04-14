@@ -106,24 +106,30 @@ async def search(request: SearchRequest):
 
     elapsed_ms = (time.time() - t0) * 1000
 
-    # Build response
+    # Build response — filter by match threshold and assign labels
+    settings = _get_settings()
     segments_response: dict[str, list[SegmentResponse]] = {}
     total_segments = 0
     for platform, seg_scores in result.segments_by_platform.items():
-        segments_response[platform] = [
-            SegmentResponse(
+        filtered: list[SegmentResponse] = []
+        for seg, score in seg_scores:
+            label = settings.classify_match(score, platform)
+            if label is None:
+                continue
+            filtered.append(SegmentResponse(
                 segment_id=seg.id,
                 name=seg.name,
                 platform=seg.platform,
                 score=score,
+                match_label=label,
                 hierarchy=seg.hierarchy,
                 segment_type=seg.segment_type,
                 audience_size=seg.audience_size,
                 description=seg.description,
-            )
-            for seg, score in seg_scores
-        ]
-        total_segments += len(seg_scores)
+            ))
+        if filtered:
+            segments_response[platform] = filtered
+            total_segments += len(filtered)
 
     matched_subs = [
         MatchedSubCategoryResponse(
@@ -289,19 +295,23 @@ async def get_equivalents(segment_id: str):
         settings=settings,
     )
 
-    return [
-        SegmentResponse(
+    filtered = []
+    for e in equivalents:
+        label = settings.classify_match(e["score"], e["platform"])
+        if label is None:
+            continue
+        filtered.append(SegmentResponse(
             segment_id=e["segment_id"],
             name=e["name"],
             platform=e["platform"],
             score=e["score"],
+            match_label=label,
             hierarchy=e.get("hierarchy", []),
             segment_type=e.get("segment_type", ""),
             audience_size=e.get("audience_size"),
             description=e.get("description"),
-        )
-        for e in equivalents
-    ]
+        ))
+    return filtered
 
 
 # ── System info ──────────────────────────────────────────────────────────

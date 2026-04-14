@@ -24,6 +24,7 @@ class SegmentResponse(BaseModel):
     name: str
     platform: str
     score: float
+    match_label: str = Field(description="'match' (>= match threshold) or 'partial_match' (>= partial threshold)")
     hierarchy: list[str]
     segment_type: str
     audience_size: int | None

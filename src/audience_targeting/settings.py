@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     similarity_threshold_equivalent: float = 0.85
     similarity_threshold_related: float = 0.65
 
+    # ── Match quality thresholds ─────────────────────────────────────────
+    # Segments scoring below partial_match are filtered out entirely.
+    # Per-platform overrides: set e.g. AT_PLATFORM_MATCH_THRESHOLDS='{"meta": {"match": 0.75, "partial_match": 0.55}}'
+    default_match_threshold: float = 0.7
+    default_partial_match_threshold: float = 0.5
+    platform_match_thresholds: dict[str, dict[str, float]] = {}
+
     # ── Clustering (build-only) ───────────────────────────────────────────
     hdbscan_metric: str = "euclidean"
     hdbscan_cluster_selection: str = "eom"
@@ -103,6 +110,28 @@ class Settings(BaseSettings):
         if self.qdrant_collection_prefix:
             return f"{self.qdrant_collection_prefix}_{base}"
         return base
+
+    def get_match_thresholds(self, platform: str) -> tuple[float, float]:
+        """Return (match_threshold, partial_match_threshold) for a platform.
+
+        Falls back to defaults when no platform-specific override exists.
+        To set per-platform thresholds, populate platform_match_thresholds:
+            {"meta": {"match": 0.75, "partial_match": 0.55}}
+        """
+        overrides = self.platform_match_thresholds.get(platform, {})
+        return (
+            overrides.get("match", self.default_match_threshold),
+            overrides.get("partial_match", self.default_partial_match_threshold),
+        )
+
+    def classify_match(self, score: float, platform: str) -> str | None:
+        """Return 'match', 'partial_match', or None (filtered out) for a score."""
+        match_thr, partial_thr = self.get_match_thresholds(platform)
+        if score >= match_thr:
+            return "match"
+        if score >= partial_thr:
+            return "partial_match"
+        return None
 
 
 def get_settings() -> Settings:

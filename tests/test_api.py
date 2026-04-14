@@ -122,6 +122,7 @@ def test_search_success(client, mock_engine, sample_search_result):
     assert len(data["segments_by_platform"]["meta"]) == 1
     assert data["segments_by_platform"]["meta"][0]["name"] == "Luxury Cars"
     assert data["segments_by_platform"]["meta"][0]["score"] == 0.92
+    assert data["segments_by_platform"]["meta"][0]["match_label"] == "match"
     assert len(data["matched_subcategories"]) == 1
     assert data["matched_subcategories"][0]["name"] == "Luxury Vehicles"
     assert len(data["recommendations"]) == 1
@@ -166,6 +167,69 @@ def test_search_no_scope_options(client, mock_engine, sample_search_result):
     data = resp.json()
     assert data["broadening_options"] == []
     assert data["narrowing_options"] == []
+
+
+# ── Match threshold filtering ────────────────────────────────────────────
+
+
+def test_search_filters_low_score_segments(client, mock_engine):
+    """Segments scoring below partial_match threshold (0.5) are excluded."""
+    low_seg = Segment(
+        id="meta_low", name="Weak Match", platform="meta", source_file="",
+        hierarchy=["Misc"], segment_type="interest",
+    )
+    mid_seg = Segment(
+        id="meta_mid", name="Partial", platform="meta", source_file="",
+        hierarchy=["Automotive"], segment_type="interest",
+    )
+    high_seg = Segment(
+        id="meta_high", name="Strong", platform="meta", source_file="",
+        hierarchy=["Automotive", "Luxury"], segment_type="interest",
+    )
+    result = SearchResult(
+        query="test",
+        matched_subcategories=[],
+        segments_by_platform={
+            "meta": [(high_seg, 0.85), (mid_seg, 0.60), (low_seg, 0.30)],
+        },
+        recommendations=[],
+        broadening_options=[],
+        narrowing_options=[],
+        sentence_topics={},
+    )
+    mock_engine.search.return_value = result
+    resp = client.post("/v1/search", json={"query": "test"})
+    data = resp.json()
+    meta_segs = data["segments_by_platform"]["meta"]
+    assert len(meta_segs) == 2  # low_seg filtered out
+    assert meta_segs[0]["match_label"] == "match"
+    assert meta_segs[0]["name"] == "Strong"
+    assert meta_segs[1]["match_label"] == "partial_match"
+    assert meta_segs[1]["name"] == "Partial"
+
+
+def test_search_filters_entire_platform_when_all_below(client, mock_engine):
+    """If all segments for a platform are below threshold, that platform is omitted."""
+    low_seg = Segment(
+        id="snap_1", name="Weak", platform="snapchat", source_file="",
+        hierarchy=["Misc"], segment_type="interest",
+    )
+    result = SearchResult(
+        query="test",
+        matched_subcategories=[],
+        segments_by_platform={
+            "snapchat": [(low_seg, 0.3)],
+        },
+        recommendations=[],
+        broadening_options=[],
+        narrowing_options=[],
+        sentence_topics={},
+    )
+    mock_engine.search.return_value = result
+    resp = client.post("/v1/search", json={"query": "test"})
+    data = resp.json()
+    assert "snapchat" not in data["segments_by_platform"]
+    assert data["metadata"]["total_segments"] == 0
 
 
 # ── Platforms endpoint ───────────────────────────────────────────────────
