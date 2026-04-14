@@ -81,3 +81,68 @@ def compute_super_category_map(
 ) -> dict[int, int]:
     """Map each sub-category to its super-category: {sub_id: super_id}."""
     return {sub.id: sub.parent_id for sub in sub_categories}
+
+
+def compute_subcategory_relationships(
+    sub_categories: list[SubCategory],
+    similarity_threshold_related: float = 0.65,
+    similarity_threshold_equivalent: float = 0.85,
+) -> dict[int, dict[str, list[int]]]:
+    """Pre-compute related/broader/narrower relationships between sub-categories.
+
+    Returns {sub_id: {"related": [ids], "broader": [ids], "narrower": [ids]}}.
+    - related: different parent, centroid similarity in [related_threshold, equivalent_threshold)
+    - broader: same parent, >=1.5x members, similarity >= 0.6
+    - narrower: same parent, <=0.67x members, similarity >= 0.6
+    """
+    # Build centroid matrix
+    valid = [sub for sub in sub_categories if sub.centroid is not None]
+    if not valid:
+        return {}
+
+    centroids = np.stack([sub.centroid.astype(np.float64) for sub in valid])
+    # L2-normalize for cosine via dot product
+    norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    centroids = centroids / norms
+
+    sim_matrix = centroids @ centroids.T
+
+    id_to_idx = {sub.id: i for i, sub in enumerate(valid)}
+    relationships: dict[int, dict[str, list[int]]] = {}
+
+    for sub in valid:
+        idx = id_to_idx[sub.id]
+        related: list[int] = []
+        broader: list[int] = []
+        narrower: list[int] = []
+
+        for other in valid:
+            if other.id == sub.id:
+                continue
+            other_idx = id_to_idx[other.id]
+            sim = float(sim_matrix[idx, other_idx])
+
+            # Related: different parent, sim in [related, equivalent)
+            if other.parent_id != sub.parent_id:
+                if similarity_threshold_related <= sim < similarity_threshold_equivalent:
+                    related.append(other.id)
+            else:
+                # Same parent — check broader/narrower
+                if sim < 0.6:
+                    continue
+                sub_count = max(sub.member_count, 1)
+                other_count = max(other.member_count, 1)
+                ratio = other_count / sub_count
+                if ratio >= 1.5:
+                    broader.append(other.id)
+                elif ratio <= 0.67:
+                    narrower.append(other.id)
+
+        relationships[sub.id] = {
+            "related": related,
+            "broader": broader,
+            "narrower": narrower,
+        }
+
+    return relationships

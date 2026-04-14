@@ -76,12 +76,12 @@ class AudienceSearchEngine:
         platforms: list[str] | None = None,
         top_k_segments: int | None = None,
     ) -> SearchResult:
-        """Execute coarse-to-fine search with sentence chunking.
+        """Execute coarse-to-fine search with sentence chunking + embedding aggregation.
 
         1. Chunk brief into sentences
-        2. For each sentence: Layer 0 -> Layer 1 -> Layer 2
-        3. Re-rank with Node2Vec + cohesion boost
-        4. Aggregate across sentences
+        2. Embed each sentence, aggregate into a single query vector
+        3. Layer 0 -> Layer 1 -> Layer 2 with aggregated vector
+        4. Re-rank with Node2Vec + cohesion boost
         5. Compute recommendations + broaden/narrow
         """
         top_k = top_k_segments or self.settings.layer2_top_k
@@ -92,30 +92,44 @@ class AudienceSearchEngine:
         sentence_topics: dict[str, list[str]] = {}
         subcategory_hit_counts: Counter = Counter()
 
-        # Cache sub-category Node2Vec vectors to avoid re-fetching
-        sub_n2v_cache: dict[int, list[float] | None] = {}
-
+        # Embed each sentence and aggregate into one vector
+        sentence_embeddings = []
         for sentence in sentences:
-            query_emb = embed_query(sentence, self.model, self.settings)
-            query_vec = query_emb.flatten().tolist()
+            emb = embed_query(sentence, self.model, self.settings)
+            sentence_embeddings.append(emb.flatten())
+        aggregated_emb = np.mean(sentence_embeddings, axis=0)
+        # L2-normalize the aggregated embedding
+        norm = np.linalg.norm(aggregated_emb)
+        if norm > 0:
+            aggregated_emb = aggregated_emb / norm
+        query_vec = aggregated_emb.tolist()
 
-            # ── Layer 0: search super-categories ─────────────────────
-            l0_results = qdrant_store.search_supercategories(
-                self.client, query_vec, self.settings
+        # Record per-sentence topics for UI display
+        for sentence in sentences:
+            sent_emb = embed_query(sentence, self.model, self.settings)
+            sent_vec = sent_emb.flatten().tolist()
+            l0_sent = qdrant_store.search_supercategories(
+                self.client, sent_vec, self.settings
             )
+            sentence_topics[sentence] = [r["name"] for r in l0_sent]
 
-            matched_super_ids = [r["super_id"] for r in l0_results]
-            sentence_topics[sentence] = [r["name"] for r in l0_results]
+        # ── Layer 0: search super-categories with aggregated vector ──
+        l0_results = qdrant_store.search_supercategories(
+            self.client, query_vec, self.settings
+        )
 
-            if not matched_super_ids:
-                continue
+        matched_super_ids = [r["super_id"] for r in l0_results]
 
+        if matched_super_ids:
             # ── Layer 1: search sub-categories within matched supers ─
             fetch_n2v = self.settings.use_node2vec
             l1_results = qdrant_store.search_subcategories(
                 self.client, query_vec, matched_super_ids, self.settings,
                 with_vectors=fetch_n2v,
             )
+
+            # Cache sub-category Node2Vec vectors to avoid re-fetching
+            sub_n2v_cache: dict[int, list[float] | None] = {}
 
             matched_sub_ids = [r["sub_id"] for r in l1_results]
 
@@ -127,46 +141,47 @@ class AudienceSearchEngine:
                     "score": r["score"],
                     "platforms": r.get("platforms", []),
                     "member_count": r.get("member_count", 0),
-                    "source_sentence": sentence,
+                    "source_sentence": query,
+                    "related_sub_ids": r.get("related_sub_ids", []),
+                    "broader_sub_ids": r.get("broader_sub_ids", []),
+                    "narrower_sub_ids": r.get("narrower_sub_ids", []),
                 })
                 # Cache Node2Vec vector for this sub-category
                 if fetch_n2v and r.get("vectors"):
                     sub_n2v_cache[r["sub_id"]] = r["vectors"].get("node2vec")
 
-            if not matched_sub_ids:
-                continue
+            if matched_sub_ids:
+                # ── Layer 2: search segments within matched sub-cats ──
+                l2_results = qdrant_store.search_segments(
+                    self.client, query_vec, matched_sub_ids, self.settings,
+                    platforms=platforms,
+                    top_k=top_k * 6,
+                    with_vectors=fetch_n2v,
+                )
 
-            # ── Layer 2: search segments within matched sub-cats ──────
-            l2_results = qdrant_store.search_segments(
-                self.client, query_vec, matched_sub_ids, self.settings,
-                platforms=platforms,
-                top_k=top_k * 6,
-                with_vectors=fetch_n2v,
-            )
+                for seg_result in l2_results:
+                    text_sim = seg_result["score"]
+                    seg_sub_id = seg_result.get("subcategory_id", -1)
 
-            for seg_result in l2_results:
-                text_sim = seg_result["score"]
-                seg_sub_id = seg_result.get("subcategory_id", -1)
+                    # Node2Vec re-ranking
+                    n2v_sim = 0.0
+                    if fetch_n2v and seg_result.get("vectors"):
+                        seg_n2v = seg_result["vectors"].get("node2vec")
+                        sub_n2v = sub_n2v_cache.get(seg_sub_id)
+                        if seg_n2v and sub_n2v:
+                            n2v_sim = _cosine_sim(seg_n2v, sub_n2v)
 
-                # Node2Vec re-ranking
-                n2v_sim = 0.0
-                if fetch_n2v and seg_result.get("vectors"):
-                    seg_n2v = seg_result["vectors"].get("node2vec")
-                    sub_n2v = sub_n2v_cache.get(seg_sub_id)
-                    if seg_n2v and sub_n2v:
-                        n2v_sim = _cosine_sim(seg_n2v, sub_n2v)
+                    if fetch_n2v:
+                        score = (
+                            self.settings.rerank_text_weight * text_sim
+                            + self.settings.rerank_graph_weight * n2v_sim
+                        )
+                    else:
+                        score = text_sim
 
-                if fetch_n2v:
-                    score = (
-                        self.settings.rerank_text_weight * text_sim
-                        + self.settings.rerank_graph_weight * n2v_sim
-                    )
-                else:
-                    score = text_sim
-
-                platform = seg_result["platform"]
-                all_candidates[platform].append((seg_result, score))
-                subcategory_hit_counts[seg_sub_id] += 1
+                    platform = seg_result["platform"]
+                    all_candidates[platform].append((seg_result, score))
+                    subcategory_hit_counts[seg_sub_id] += 1
 
         # ── Cohesion boost (replaces neighbor boost) ─────────────────
         total_hits = sum(subcategory_hit_counts.values())
@@ -215,11 +230,11 @@ class AudienceSearchEngine:
             for ms in deduped_subs
         ]
 
-        # ── Recommendations via vector similarity ────────────────────
-        matched_sub_ids = [ms["sub_id"] for ms in deduped_subs[:10]]
-        recommendations = self._get_recommendations(deduped_subs[:10], matched_sub_ids)
-        broadening = self._get_scope_options(deduped_subs[:10], matched_sub_ids, "broader")
-        narrowing = self._get_scope_options(deduped_subs[:10], matched_sub_ids, "narrower")
+        # ── Recommendations from pre-computed payloads ────────────────
+        matched_sub_ids_set = {ms["sub_id"] for ms in deduped_subs}
+        recommendations = self._get_recommendations_from_payloads(deduped_subs[:10], matched_sub_ids_set)
+        broadening = self._get_scope_from_payloads(deduped_subs[:10], matched_sub_ids_set, "broader")
+        narrowing = self._get_scope_from_payloads(deduped_subs[:10], matched_sub_ids_set, "narrower")
 
         return SearchResult(
             query=query,
@@ -231,103 +246,68 @@ class AudienceSearchEngine:
             sentence_topics=sentence_topics,
         )
 
-    def _get_recommendations(
-        self, matched_subs: list[dict], matched_sub_ids: list[int], max_recs: int = 5
+    def _get_recommendations_from_payloads(
+        self, matched_subs: list[dict], matched_sub_ids: set[int], max_recs: int = 5
     ) -> list[Recommendation]:
-        """Find related sub-categories via vector similarity — replaces RELATED_TO edges."""
-        all_recs: dict[int, dict] = {}
-
+        """Look up pre-computed related_sub_ids from payloads, fetch details in one batch."""
+        candidate_ids: set[int] = set()
         for ms in matched_subs:
-            results = qdrant_store.get_related_subcategories(
-                self.client,
-                centroid_vector=self._get_sub_centroid(ms["sub_id"]),
-                exclude_sub_ids=matched_sub_ids + list(all_recs.keys()),
-                exclude_parent_id=ms.get("parent_super_id"),
-                settings=self.settings,
-                max_results=max_recs,
-            )
-            for r in results:
-                rid = r["sub_id"]
-                if rid not in all_recs or r["score"] > all_recs[rid]["score"]:
-                    all_recs[rid] = r
+            for rid in ms.get("related_sub_ids", []):
+                if rid not in matched_sub_ids:
+                    candidate_ids.add(rid)
 
-        sorted_recs = sorted(all_recs.values(), key=lambda x: x["score"], reverse=True)[:max_recs]
+        if not candidate_ids:
+            return []
+
+        details = self._fetch_sub_details(list(candidate_ids))
+        sorted_details = sorted(details, key=lambda d: d.get("member_count", 0), reverse=True)
         return [
             Recommendation(
-                sub_id=r["sub_id"], name=r["name"], relation="related",
-                score=r["score"], member_count=r.get("member_count", 0),
-                platforms=r.get("platforms", []),
+                sub_id=d["sub_id"], name=d["name"], relation="related",
+                score=0.0, member_count=d.get("member_count", 0),
+                platforms=d.get("platforms", []),
             )
-            for r in sorted_recs
+            for d in sorted_details[:max_recs]
         ]
 
-    def _get_scope_options(
-        self, matched_subs: list[dict], matched_sub_ids: list[int], direction: str, max_opts: int = 3
+    def _get_scope_from_payloads(
+        self, matched_subs: list[dict], matched_sub_ids: set[int], direction: str, max_opts: int = 3
     ) -> list[Recommendation]:
-        """Find broader or narrower sub-categories — replaces BROADER_THAN/NARROWER_THAN edges."""
-        opts: dict[int, dict] = {}
-
+        """Look up pre-computed broader/narrower_sub_ids from payloads, fetch details in one batch."""
+        key = f"{direction}_sub_ids"
+        candidate_ids: set[int] = set()
         for ms in matched_subs:
-            siblings = qdrant_store.get_siblings(
-                self.client,
-                parent_super_id=ms["parent_super_id"],
-                exclude_sub_ids=matched_sub_ids,
-                settings=self.settings,
-                with_vectors=True,
-            )
+            for sid in ms.get(key, []):
+                if sid not in matched_sub_ids:
+                    candidate_ids.add(sid)
 
-            ms_centroid = self._get_sub_centroid(ms["sub_id"])
-            ms_count = ms.get("member_count", 0)
+        if not candidate_ids:
+            return []
 
-            for sib in siblings:
-                sib_count = sib.get("member_count", 0)
-                sib_id = sib["sub_id"]
-
-                # Compute centroid similarity
-                sib_centroid = sib.get("vectors", {}).get("bge", [])
-                if not sib_centroid or not ms_centroid:
-                    continue
-                sim = _cosine_sim(ms_centroid, sib_centroid)
-                if sim < 0.6:
-                    continue
-
-                if direction == "broader" and sib_count >= ms_count * 1.5:
-                    if sib_id not in opts or sim > opts[sib_id].get("score", 0):
-                        opts[sib_id] = {**sib, "score": sim}
-                elif direction == "narrower" and ms_count > 0 and sib_count <= ms_count * 0.67:
-                    if sib_id not in opts or sim > opts[sib_id].get("score", 0):
-                        opts[sib_id] = {**sib, "score": sim}
-
-        sorted_opts = sorted(opts.values(), key=lambda x: x["score"], reverse=True)[:max_opts]
+        details = self._fetch_sub_details(list(candidate_ids))
+        sorted_details = sorted(details, key=lambda d: d.get("member_count", 0), reverse=True)
         return [
             Recommendation(
-                sub_id=o["sub_id"], name=o["name"], relation=direction,
-                score=o["score"], member_count=o.get("member_count", 0),
-                platforms=o.get("platforms", []),
+                sub_id=d["sub_id"], name=d["name"], relation=direction,
+                score=0.0, member_count=d.get("member_count", 0),
+                platforms=d.get("platforms", []),
             )
-            for o in sorted_opts
+            for d in sorted_details[:max_opts]
         ]
 
-    def _get_sub_centroid(self, sub_id: int) -> list[float]:
-        """Retrieve a sub-category's BGE centroid vector from Qdrant."""
+    def _fetch_sub_details(self, sub_ids: list[int]) -> list[dict]:
+        """Batch-fetch sub-category details by IDs — single Qdrant scroll."""
+        if not sub_ids:
+            return []
+        from qdrant_client.models import FieldCondition, Filter, MatchAny
         results, _ = self.client.scroll(
             collection_name=self.settings.collection_name("subcategories"),
             scroll_filter=Filter(must=[
-                FieldCondition(key="sub_id", match=MatchValue(value=sub_id)),
+                FieldCondition(key="sub_id", match=MatchAny(any=sub_ids)),
             ]),
-            limit=1,
-            with_vectors=True,
+            limit=len(sub_ids),
         )
-        if results and results[0].vector:
-            vec = results[0].vector
-            if isinstance(vec, dict):
-                return vec.get("bge", [])
-            return vec
-        return []
-
-
-# Import needed for _get_sub_centroid
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+        return [r.payload for r in results]
 
 
 # ── Helper ───────────────────────────────────────────────────────────────

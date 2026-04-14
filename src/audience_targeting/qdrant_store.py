@@ -124,8 +124,13 @@ def ingest_subcategories(
     sub_categories: list[SubCategory],
     node2vec_embeddings: dict[str, np.ndarray] | None,
     settings: Settings,
+    relationships: dict[int, dict[str, list[int]]] | None = None,
 ) -> None:
-    """Upsert sub-category points into Qdrant."""
+    """Upsert sub-category points into Qdrant.
+
+    If relationships dict is provided, stores pre-computed related_sub_ids,
+    broader_sub_ids, and narrower_sub_ids in each payload for fast lookup.
+    """
     points = []
     for i, sub in enumerate(sub_categories):
         vectors: dict[str, list[float]] = {"bge": sub.centroid.tolist()}
@@ -135,17 +140,25 @@ def ingest_subcategories(
             if n2v_key in node2vec_embeddings:
                 vectors["node2vec"] = node2vec_embeddings[n2v_key].tolist()
 
+        payload = {
+            "sub_id": int(sub.id),
+            "name": sub.name,
+            "parent_super_id": int(sub.parent_id),
+            "segment_ids": [str(s) for s in sub.segment_ids],
+            "platforms": list(sub.platforms),
+            "member_count": int(sub.member_count),
+        }
+
+        if relationships and sub.id in relationships:
+            rels = relationships[sub.id]
+            payload["related_sub_ids"] = rels.get("related", [])
+            payload["broader_sub_ids"] = rels.get("broader", [])
+            payload["narrower_sub_ids"] = rels.get("narrower", [])
+
         points.append(PointStruct(
             id=i,
             vector=vectors,
-            payload={
-                "sub_id": int(sub.id),
-                "name": sub.name,
-                "parent_super_id": int(sub.parent_id),
-                "segment_ids": [str(s) for s in sub.segment_ids],
-                "platforms": list(sub.platforms),
-                "member_count": int(sub.member_count),
-            },
+            payload=payload,
         ))
 
     client.upsert(

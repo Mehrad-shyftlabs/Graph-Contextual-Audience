@@ -21,6 +21,7 @@ from audience_targeting.enrichment import apply_cached_descriptions, enrich_segm
 from audience_targeting.relationships import (
     compute_parent_segment_ids,
     compute_subcategory_map,
+    compute_subcategory_relationships,
     compute_super_category_map,
 )
 from audience_targeting.settings import Settings
@@ -58,8 +59,17 @@ def build(settings: Settings, skip_node2vec: bool = False, run_enrichment: bool 
     parent_segment_map = compute_parent_segment_ids(segments)
     subcategory_map = compute_subcategory_map(segments, l1_labels, sub_cats)
     super_category_map = compute_super_category_map(sub_cats)
+    sub_relationships = compute_subcategory_relationships(
+        sub_cats,
+        similarity_threshold_related=settings.similarity_threshold_related,
+        similarity_threshold_equivalent=settings.similarity_threshold_equivalent,
+    )
+    n_related = sum(len(r["related"]) for r in sub_relationships.values())
+    n_broader = sum(len(r["broader"]) for r in sub_relationships.values())
+    n_narrower = sum(len(r["narrower"]) for r in sub_relationships.values())
     print(f"  Parent segments: {len(parent_segment_map)}")
     print(f"  Subcategory assignments: {len(subcategory_map)}")
+    print(f"  Pre-computed edges: {n_related} related, {n_broader} broader, {n_narrower} narrower")
 
     # Step 6: Node2Vec (optional)
     node2vec_embeddings: dict | None = None
@@ -77,7 +87,7 @@ def build(settings: Settings, skip_node2vec: bool = False, run_enrichment: bool 
 
     qdrant_store.create_collections(client, settings)
     qdrant_store.ingest_supercategories(client, super_cats, settings)
-    qdrant_store.ingest_subcategories(client, sub_cats, node2vec_embeddings, settings)
+    qdrant_store.ingest_subcategories(client, sub_cats, node2vec_embeddings, settings, sub_relationships)
     qdrant_store.ingest_segments(
         client, segments, embeddings,
         subcategory_map, super_category_map, parent_segment_map,
