@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     # ── Qdrant ────────────────────────────────────────────────────────────
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str | None = None
+    qdrant_path: str | None = None  # When set, use local file-based Qdrant (no server needed)
     qdrant_collection_prefix: str = ""
 
     # ── Embedding ─────────────────────────────────────────────────────────
@@ -104,6 +105,14 @@ class Settings(BaseSettings):
     @property
     def yahoo_json_files(self) -> list[Path]:
         return sorted(self.data_dir.glob("yahoo_*.json"))
+
+    def create_qdrant_client(self):
+        """Create a QdrantClient using local path or remote URL."""
+        from qdrant_client import QdrantClient
+
+        if self.qdrant_path:
+            return QdrantClient(path=self.qdrant_path)
+        return QdrantClient(url=self.qdrant_url, api_key=self.qdrant_api_key)
 
     def collection_name(self, base: str) -> str:
         """Return a collection name with optional prefix for multi-tenant setups."""

@@ -73,7 +73,7 @@ def build(settings: Settings, skip_node2vec: bool = False, run_enrichment: bool 
 
     # Step 7: Ingest into Qdrant
     print("\n[7/7] Ingesting into Qdrant...")
-    client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+    client = settings.create_qdrant_client()
 
     qdrant_store.create_collections(client, settings)
     qdrant_store.ingest_supercategories(client, super_cats, settings)
@@ -165,12 +165,15 @@ def main():
     parser = argparse.ArgumentParser(description="Build audience targeting data pipeline")
     parser.add_argument("--skip-node2vec", action="store_true", help="Skip Node2Vec training")
     parser.add_argument("--qdrant-url", type=str, help="Override Qdrant URL")
+    parser.add_argument("--qdrant-path", type=str, help="Use local file-based Qdrant (no server needed)")
     parser.add_argument("--enrich", action="store_true", help="Run LLM enrichment (requires OPENAI_API_KEY)")
     parser.add_argument("--data-dir", type=str, help="Override data directory")
     args = parser.parse_args()
 
     settings = Settings()
-    if args.qdrant_url:
+    if args.qdrant_path:
+        settings.qdrant_path = args.qdrant_path
+    elif args.qdrant_url:
         settings.qdrant_url = args.qdrant_url
     if args.data_dir:
         from pathlib import Path

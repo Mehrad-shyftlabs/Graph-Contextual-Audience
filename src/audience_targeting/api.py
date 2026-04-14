@@ -6,6 +6,7 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from qdrant_client import QdrantClient
 
 from audience_targeting.api_models import (
@@ -45,6 +46,13 @@ app = FastAPI(
     version="2.0.0",
     description="AI-powered cross-platform audience segment matching",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

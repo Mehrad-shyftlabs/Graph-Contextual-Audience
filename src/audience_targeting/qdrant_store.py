@@ -17,7 +17,6 @@ from qdrant_client.models import (
     PayloadSchemaType,
     PointStruct,
     VectorParams,
-    VectorsConfig,
 )
 
 from audience_targeting.models import Segment, SubCategory, SuperCategory
@@ -35,11 +34,9 @@ def create_collections(client: QdrantClient, settings: Settings) -> None:
     # supercategories: single BGE vector
     client.recreate_collection(
         collection_name=settings.collection_name("supercategories"),
-        vectors_config=VectorsConfig(
-            params_map={
-                "bge": VectorParams(size=settings.embedding_dim, distance=Distance.COSINE),
-            }
-        ),
+        vectors_config={
+            "bge": VectorParams(size=settings.embedding_dim, distance=Distance.COSINE),
+        },
     )
 
     # subcategories: BGE + optional Node2Vec
@@ -48,7 +45,7 @@ def create_collections(client: QdrantClient, settings: Settings) -> None:
         vectors["node2vec"] = VectorParams(size=settings.node2vec_dim, distance=Distance.COSINE)
     client.recreate_collection(
         collection_name=settings.collection_name("subcategories"),
-        vectors_config=VectorsConfig(params_map=vectors),
+        vectors_config=vectors,
     )
 
     # segments: BGE + optional Node2Vec
@@ -57,7 +54,7 @@ def create_collections(client: QdrantClient, settings: Settings) -> None:
         vectors["node2vec"] = VectorParams(size=settings.node2vec_dim, distance=Distance.COSINE)
     client.recreate_collection(
         collection_name=settings.collection_name("segments"),
-        vectors_config=VectorsConfig(params_map=vectors),
+        vectors_config=vectors,
     )
 
     # Payload indexes for filtered search
@@ -84,6 +81,17 @@ def _create_payload_indexes(client: QdrantClient, settings: Settings) -> None:
 # ── Ingestion ────────────────────────────────────────────────────────────
 
 
+def _py(val):
+    """Convert numpy scalars to native Python types for JSON serialization."""
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (np.floating,)):
+        return float(val)
+    if isinstance(val, np.ndarray):
+        return val.tolist()
+    return val
+
+
 def ingest_supercategories(
     client: QdrantClient,
     super_categories: list[SuperCategory],
@@ -96,11 +104,11 @@ def ingest_supercategories(
             id=i,
             vector={"bge": sc.centroid.tolist()},
             payload={
-                "super_id": sc.id,
+                "super_id": int(sc.id),
                 "name": sc.name,
                 "subcategory_ids": [int(x) for x in sc.subcategory_ids],
                 "platforms": list(sc.platforms),
-                "member_count": sc.member_count,
+                "member_count": int(sc.member_count),
             },
         ))
 
@@ -131,12 +139,12 @@ def ingest_subcategories(
             id=i,
             vector=vectors,
             payload={
-                "sub_id": sub.id,
+                "sub_id": int(sub.id),
                 "name": sub.name,
-                "parent_super_id": sub.parent_id,
-                "segment_ids": sub.segment_ids,
+                "parent_super_id": int(sub.parent_id),
+                "segment_ids": [str(s) for s in sub.segment_ids],
                 "platforms": list(sub.platforms),
-                "member_count": sub.member_count,
+                "member_count": int(sub.member_count),
             },
         ))
 
@@ -176,16 +184,16 @@ def ingest_segments(
             id=i,
             vector=vectors,
             payload={
-                "segment_id": seg.id,
-                "name": seg.name,
-                "platform": seg.platform,
-                "subcategory_id": sub_id,
-                "super_category_id": super_id,
-                "hierarchy": seg.hierarchy,
+                "segment_id": str(seg.id),
+                "name": str(seg.name),
+                "platform": str(seg.platform),
+                "subcategory_id": int(sub_id),
+                "super_category_id": int(super_id),
+                "hierarchy": [str(h) for h in seg.hierarchy],
                 "hierarchy_text": " > ".join(seg.hierarchy),
-                "segment_type": seg.segment_type,
-                "audience_size": seg.audience_size or 0,
-                "description": seg.description or "",
+                "segment_type": str(seg.segment_type or ""),
+                "audience_size": int(seg.audience_size) if seg.audience_size else 0,
+                "description": str(seg.description or ""),
                 "parent_segment_id": parent_segment_map.get(seg.id),
             },
         ))

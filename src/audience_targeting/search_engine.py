@@ -156,10 +156,13 @@ class AudienceSearchEngine:
                     if seg_n2v and sub_n2v:
                         n2v_sim = _cosine_sim(seg_n2v, sub_n2v)
 
-                score = (
-                    self.settings.rerank_text_weight * text_sim
-                    + self.settings.rerank_graph_weight * n2v_sim
-                )
+                if fetch_n2v:
+                    score = (
+                        self.settings.rerank_text_weight * text_sim
+                        + self.settings.rerank_graph_weight * n2v_sim
+                    )
+                else:
+                    score = text_sim
 
                 platform = seg_result["platform"]
                 all_candidates[platform].append((seg_result, score))
@@ -352,7 +355,7 @@ def create_engine(settings: Settings | None = None) -> AudienceSearchEngine:
     if settings is None:
         settings = Settings()
 
-    client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+    client = settings.create_qdrant_client()
     model = SentenceTransformer(settings.embedding_model)
 
     return AudienceSearchEngine(client=client, model=model, settings=settings)
