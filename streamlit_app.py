@@ -293,7 +293,7 @@ def render_platform_card(platform: str, segments: list) -> str:
             {"<div class='score-desc'>" + desc + "</div>" if desc else ""}
           </div>
           <div class="score-bar-wrap">{render_score_bar(score)}</div>
-          <div class="score-val" style="color:{score_color(score)};">{score:.0%}</div>
+          <div class="score-val" style="color:{score_color(score)};">{score:.1%}</div>
           <div class="score-badge">{render_badge(match_label)}</div>
         </div>'''
 
