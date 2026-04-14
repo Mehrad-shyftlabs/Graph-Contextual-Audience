@@ -1,0 +1,43 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: serve
+    ports:
+      - "8000:8000"
+    environment:
+      AT_QDRANT_URL: http://qdrant:6333
+      AT_LOG_LEVEL: INFO
+    depends_on:
+      - qdrant
+
+  build-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: build
+    environment:
+      AT_QDRANT_URL: http://qdrant:6333
+      AT_OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AT_DATA_DIR: /app/data
+      AT_ENRICHED_DIR: /app/data/enriched
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - qdrant
+    profiles:
+      - build
+
+volumes:
+  qdrant_data:
