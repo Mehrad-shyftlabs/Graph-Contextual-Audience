@@ -1,8 +1,20 @@
 # Environment
 .env
+.venv/
+venv/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Python build artifacts
+*.egg-info/
+dist/
+build/
+.coverage
+.tox/
+
+# Local database
+qdrant_local/
 
 # Methodology (internal)
 methodology.md
@@ -19,3 +31,6 @@ data/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Testing
+.pytest_cache/

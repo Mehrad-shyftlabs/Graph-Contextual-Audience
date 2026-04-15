@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     log_level: str = "INFO"
+    api_key: str | None = None  # Set to enable API key auth; None = auth disabled
+    cors_origins: list[str] = ["*"]  # Restrict in production
+    rate_limit: str = "60/minute"  # Rate limit for search endpoint
 
     # ── Platforms ─────────────────────────────────────────────────────────
     platforms: list[str] = [

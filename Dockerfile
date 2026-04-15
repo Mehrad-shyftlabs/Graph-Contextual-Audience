@@ -30,8 +30,19 @@ CMD ["python", "-m", "audience_targeting.build_pipeline"]
 FROM base AS serve
 RUN pip install --no-cache-dir \
     fastapi>=0.104.0 \
-    uvicorn[standard]>=0.24.0
+    uvicorn[standard]>=0.24.0 \
+    gunicorn>=21.2.0 \
+    python-json-logger>=2.0.0 \
+    slowapi>=0.1.9
+
+RUN useradd -m -u 1000 appuser
+
 COPY src/ src/
 ENV PYTHONPATH=/app/src
+USER appuser
 EXPOSE 8000
-CMD ["uvicorn", "audience_targeting.api:app", "--host", "0.0.0.0", "--port", "8000"]
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+CMD ["sh", "-c", "gunicorn audience_targeting.api:app -k uvicorn.workers.UvicornWorker --workers ${WEB_CONCURRENCY:-2} --bind 0.0.0.0:8000 --timeout 180 --graceful-timeout 30"]

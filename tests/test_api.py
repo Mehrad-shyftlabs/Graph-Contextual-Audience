@@ -242,3 +242,154 @@ def test_list_platforms(client):
     assert isinstance(platforms, list)
     assert "meta" in platforms
     assert "tiktok" in platforms
+
+
+# ── Auth tests ──────────────────────────────────────────────────────────
+
+
+def test_auth_disabled_by_default(client, mock_engine, sample_search_result):
+    """When api_key is None (default), all requests pass without a key."""
+    mock_engine.search.return_value = sample_search_result
+    resp = client.post("/v1/search", json={"query": "test"})
+    assert resp.status_code == 200
+
+
+def test_auth_rejects_missing_key(client, mock_engine, sample_search_result):
+    """When api_key is set, requests without a key get 401."""
+    import audience_targeting.api as api_module
+    original = api_module._settings.api_key
+    api_module._settings.api_key = "secret"
+    try:
+        resp = client.post("/v1/search", json={"query": "test"})
+        assert resp.status_code == 401
+    finally:
+        api_module._settings.api_key = original
+
+
+def test_auth_rejects_wrong_key(client, mock_engine, sample_search_result):
+    """When api_key is set, a wrong key gets 401."""
+    import audience_targeting.api as api_module
+    original = api_module._settings.api_key
+    api_module._settings.api_key = "secret"
+    try:
+        resp = client.post(
+            "/v1/search",
+            json={"query": "test"},
+            headers={"X-API-Key": "wrong"},
+        )
+        assert resp.status_code == 401
+    finally:
+        api_module._settings.api_key = original
+
+
+def test_auth_accepts_correct_key(client, mock_engine, sample_search_result):
+    """When api_key is set, the correct key passes through."""
+    import audience_targeting.api as api_module
+    original = api_module._settings.api_key
+    api_module._settings.api_key = "secret"
+    mock_engine.search.return_value = sample_search_result
+    try:
+        resp = client.post(
+            "/v1/search",
+            json={"query": "test"},
+            headers={"X-API-Key": "secret"},
+        )
+        assert resp.status_code == 200
+    finally:
+        api_module._settings.api_key = original
+
+
+def test_health_exempt_from_auth(client):
+    """Health and ready endpoints never require an API key."""
+    import audience_targeting.api as api_module
+    original = api_module._settings.api_key
+    api_module._settings.api_key = "secret"
+    try:
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        resp = client.get("/ready")
+        assert resp.status_code == 200
+    finally:
+        api_module._settings.api_key = original
+
+
+# ── Request ID tests ────────────────────────────────────────────────────
+
+
+def test_request_id_returned(client):
+    """When X-Request-ID is sent, the same value is returned."""
+    resp = client.get("/health", headers={"X-Request-ID": "test-123"})
+    assert resp.headers.get("X-Request-ID") == "test-123"
+
+
+def test_request_id_generated(client):
+    """When no X-Request-ID is sent, one is generated and returned."""
+    resp = client.get("/health")
+    request_id = resp.headers.get("X-Request-ID")
+    assert request_id is not None
+    assert len(request_id) > 0
+
+
+# ── Account-level threshold tests ───────────────────────────────────────
+
+
+def test_search_with_custom_match_threshold(client, mock_engine):
+    """Account-level match_threshold overrides server default."""
+    seg = Segment(
+        id="meta_1", name="Strong", platform="meta", source_file="",
+        hierarchy=["Auto"], segment_type="interest",
+    )
+    result = SearchResult(
+        query="test",
+        matched_subcategories=[],
+        segments_by_platform={"meta": [(seg, 0.85)]},
+        recommendations=[],
+        broadening_options=[],
+        narrowing_options=[],
+        sentence_topics={},
+    )
+    mock_engine.search.return_value = result
+
+    # Default threshold (0.7): score 0.85 -> "match"
+    resp = client.post("/v1/search", json={"query": "test"})
+    data = resp.json()
+    assert data["segments_by_platform"]["meta"][0]["match_label"] == "match"
+
+    # Custom threshold (0.9): score 0.85 -> "partial_match"
+    resp = client.post("/v1/search", json={
+        "query": "test",
+        "match_threshold": 0.9,
+    })
+    data = resp.json()
+    assert data["segments_by_platform"]["meta"][0]["match_label"] == "partial_match"
+
+
+def test_search_with_custom_partial_threshold(client, mock_engine):
+    """Account-level partial_match_threshold filters out low-scoring segments."""
+    seg = Segment(
+        id="meta_1", name="Weak", platform="meta", source_file="",
+        hierarchy=["Misc"], segment_type="interest",
+    )
+    result = SearchResult(
+        query="test",
+        matched_subcategories=[],
+        segments_by_platform={"meta": [(seg, 0.55)]},
+        recommendations=[],
+        broadening_options=[],
+        narrowing_options=[],
+        sentence_topics={},
+    )
+    mock_engine.search.return_value = result
+
+    # Default partial threshold (0.5): score 0.55 -> "partial_match"
+    resp = client.post("/v1/search", json={"query": "test"})
+    data = resp.json()
+    assert "meta" in data["segments_by_platform"]
+
+    # Custom partial threshold (0.6): score 0.55 -> filtered out
+    resp = client.post("/v1/search", json={
+        "query": "test",
+        "partial_match_threshold": 0.6,
+    })
+    data = resp.json()
+    assert "meta" not in data["segments_by_platform"]
