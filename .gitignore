@@ -34,3 +34,5 @@ data/
 
 # Testing
 .pytest_cache/
+
+/.claude/
