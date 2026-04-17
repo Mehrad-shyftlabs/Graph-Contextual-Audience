@@ -55,7 +55,10 @@ async def lifespan(app: FastAPI):
     setup_logging(_settings.log_level)
     _engine = create_engine(_settings)
 
-    # Verify required Qdrant collections exist and have data
+    # Verify required Qdrant collections (or aliases) exist and have data.
+    # Qdrant resolves aliases transparently in search/scroll calls, so the
+    # API only needs the alias name.  get_collection works with both real
+    # collection names and aliases.
     for base in ("supercategories", "subcategories", "segments"):
         coll = _settings.collection_name(base)
         try:
@@ -66,7 +69,10 @@ async def lifespan(app: FastAPI):
                 logger.info("Collection '%s': %d points", coll, info.points_count)
         except Exception as e:
             logger.error("Required collection '%s' not found: %s", coll, e)
-            raise RuntimeError(f"Missing required Qdrant collection: {coll}") from e
+            raise RuntimeError(
+                f"Missing required Qdrant collection or alias: {coll}. "
+                "Run the build pipeline first: python -m audience_targeting.build_pipeline"
+            ) from e
 
     yield
     _engine = None

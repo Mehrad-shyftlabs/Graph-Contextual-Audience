@@ -1,14 +1,26 @@
-"""Enrich audience segments with LLM-generated descriptions using OpenAI GPT-4o-mini."""
+"""Enrich audience segments with LLM-generated descriptions using OpenAI GPT-4o-mini.
+
+Standalone usage
+~~~~~~~~~~~~~~~~
+Run enrichment independently of the full build pipeline::
+
+    python -m audience_targeting.enrichment                 # report coverage only
+    python -m audience_targeting.enrichment --run           # generate missing descriptions
+    python -m audience_targeting.enrichment --platform meta # enrich one platform
+"""
 
 from __future__ import annotations
 
 import json
+import logging
 import os
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from audience_targeting.models import Segment
 from audience_targeting.settings import Settings
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """You are an ad-tech audience taxonomy expert. You deeply understand how digital advertising platforms categorize users into audience segments for targeting.
@@ -216,3 +228,146 @@ def _save_cache(path: Path, descriptions: list[dict]) -> None:
 def _load_cache(path: Path) -> list[dict]:
     with open(path) as f:
         return json.load(f)
+
+
+# ── Coverage report ─────────────────────────────────────────────────────
+
+
+_COVERAGE_WARNING_THRESHOLD = 0.80  # warn below 80%
+
+
+def enrichment_coverage(
+    segments: list[Segment],
+    settings: Settings | None = None,
+) -> dict[str, dict[str, int | float]]:
+    """Return enrichment coverage stats per platform.
+
+    Returns ``{platform: {"total": N, "enriched": N, "missing": N, "pct": 0–100}}``.
+    Also logs a WARNING for any platform below 80% coverage.
+    """
+    if settings is None:
+        settings = Settings()
+
+    # Apply cached descriptions first so we see the true state.
+    apply_cached_descriptions(segments, settings)
+
+    total: Counter[str] = Counter()
+    enriched: Counter[str] = Counter()
+    for seg in segments:
+        total[seg.platform] += 1
+        if seg.description:
+            enriched[seg.platform] += 1
+
+    report: dict[str, dict[str, int | float]] = {}
+    for platform in sorted(total.keys()):
+        t = total[platform]
+        e = enriched[platform]
+        pct = round(e / t * 100, 1) if t else 100.0
+        report[platform] = {"total": t, "enriched": e, "missing": t - e, "pct": pct}
+        if pct < _COVERAGE_WARNING_THRESHOLD * 100:
+            logger.warning(
+                "Low enrichment coverage for %s: %d/%d (%.0f%%). "
+                "Run: python -m audience_targeting.enrichment --run --platform %s",
+                platform, e, t, pct, platform,
+            )
+
+    return report
+
+
+def print_coverage_report(segments: list[Segment], settings: Settings | None = None) -> None:
+    """Print a human-readable enrichment coverage table to stdout."""
+    report = enrichment_coverage(segments, settings)
+
+    print(f"\n{'Platform':15s}  {'Enriched':>10s}  {'Total':>7s}  {'Coverage':>9s}  Status")
+    print("-" * 60)
+    for platform, stats in report.items():
+        pct = stats["pct"]
+        status = "OK" if pct >= _COVERAGE_WARNING_THRESHOLD * 100 else "LOW"
+        print(
+            f"  {platform:13s}  {stats['enriched']:7d}  /{stats['total']:5d}  "
+            f"{pct:7.1f}%    {status}"
+        )
+
+    total_segs = sum(s["total"] for s in report.values())
+    total_enriched = sum(s["enriched"] for s in report.values())
+    total_pct = round(total_enriched / total_segs * 100, 1) if total_segs else 100.0
+    print("-" * 60)
+    print(f"  {'TOTAL':13s}  {total_enriched:7d}  /{total_segs:5d}  {total_pct:7.1f}%")
+
+    missing_platforms = [p for p, s in report.items() if s["missing"] > 0]
+    if missing_platforms:
+        print(f"\nTo enrich missing segments:")
+        print(f"  python -m audience_targeting.enrichment --run")
+        print(f"  python -m audience_targeting.enrichment --run --platform <name>")
+
+
+# ── Standalone CLI ──────────────────────────────────────────────────────
+
+
+def main() -> None:
+    """Standalone enrichment CLI — check coverage or generate missing descriptions."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Audience segment enrichment — check coverage or generate descriptions",
+    )
+    parser.add_argument(
+        "--run", action="store_true",
+        help="Generate missing descriptions (requires AT_OPENAI_API_KEY). "
+             "Without this flag, only prints the coverage report.",
+    )
+    parser.add_argument(
+        "--platform", type=str, default=None,
+        help="Restrict to a single platform (e.g. meta, tiktok, dv360).",
+    )
+    parser.add_argument(
+        "--data-dir", type=str, default=None,
+        help="Override data directory path.",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="Override enrichment batch size (default: 25).",
+    )
+    args = parser.parse_args()
+
+    settings = Settings()
+    if args.data_dir:
+        settings.data_dir = Path(args.data_dir)
+        settings.enriched_dir = Path(args.data_dir) / "enriched"
+    if args.batch_size:
+        settings.enrichment_batch_size = args.batch_size
+
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level),
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    from audience_targeting.data_loader import load_all
+
+    print("Loading segments...")
+    segments = load_all(settings)
+
+    if args.platform:
+        before = len(segments)
+        segments = [s for s in segments if s.platform == args.platform]
+        if not segments:
+            print(f"No segments found for platform '{args.platform}'")
+            return
+        print(f"Filtered to {len(segments)}/{before} segments for platform '{args.platform}'")
+
+    print_coverage_report(segments, settings)
+
+    if args.run:
+        if not settings.openai_api_key:
+            print("\nERROR: AT_OPENAI_API_KEY not set. Cannot generate descriptions.")
+            print("Set the key in .env or as an environment variable and retry.")
+            return
+        print("\nRunning enrichment...")
+        enrich_segments(segments, settings, resume=True)
+        print("\nUpdated coverage:")
+        # Re-check after enrichment
+        print_coverage_report(segments, settings)
+
+
+if __name__ == "__main__":
+    main()

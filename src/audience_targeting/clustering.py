@@ -5,6 +5,7 @@ Produces SuperCategory (Layer 0) + SubCategory (Layer 1) hierarchy from embeddin
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 
 import hdbscan
@@ -12,6 +13,8 @@ import numpy as np
 
 from audience_targeting.models import Segment, SubCategory, SuperCategory
 from audience_targeting.settings import Settings
+
+logger = logging.getLogger(__name__)
 
 
 def cluster_two_level(
@@ -28,18 +31,31 @@ def cluster_two_level(
 
     n = len(segments)
 
+    if n == 0:
+        raise ValueError("Cannot cluster: no segments provided")
+    if embeddings.shape[0] != n:
+        raise ValueError(
+            f"Embedding/segment count mismatch: {embeddings.shape[0]} embeddings vs {n} segments"
+        )
+
     # ── Pass 1: Layer 0 (broad super-categories) ─────────────────────
     print(f"\n{'='*60}")
     print("PASS 1: Layer 0 super-categories")
     print(f"{'='*60}")
 
-    l0_clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=settings.layer0_cluster_size,
-        min_samples=settings.layer0_min_samples,
-        metric=settings.hdbscan_metric,
-        cluster_selection_method=settings.hdbscan_cluster_selection,
-    )
-    l0_labels_raw = l0_clusterer.fit_predict(embeddings)
+    try:
+        l0_clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=settings.layer0_cluster_size,
+            min_samples=settings.layer0_min_samples,
+            metric=settings.hdbscan_metric,
+            cluster_selection_method=settings.hdbscan_cluster_selection,
+        )
+        l0_labels_raw = l0_clusterer.fit_predict(embeddings)
+    except Exception as exc:
+        raise RuntimeError(
+            f"HDBSCAN Layer 0 clustering failed ({n} segments, "
+            f"min_cluster_size={settings.layer0_cluster_size}): {exc}"
+        ) from exc
 
     n_l0 = len(set(l0_labels_raw)) - (1 if -1 in l0_labels_raw else 0)
     n_noise = (l0_labels_raw == -1).sum()
@@ -102,13 +118,39 @@ def cluster_two_level(
                 l1_labels[idx] = sub_id
             continue
 
-        l1_clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=settings.layer1_cluster_size,
-            min_samples=settings.layer1_min_samples,
-            metric=settings.hdbscan_metric,
-            cluster_selection_method=settings.hdbscan_cluster_selection,
-        )
-        local_labels_raw = l1_clusterer.fit_predict(l0_embs)
+        try:
+            l1_clusterer = hdbscan.HDBSCAN(
+                min_cluster_size=settings.layer1_cluster_size,
+                min_samples=settings.layer1_min_samples,
+                metric=settings.hdbscan_metric,
+                cluster_selection_method=settings.hdbscan_cluster_selection,
+            )
+            local_labels_raw = l1_clusterer.fit_predict(l0_embs)
+        except Exception as exc:
+            # Layer 1 clustering failed for this super-category — collapse
+            # all its members into a single sub-category so the build can
+            # continue instead of crashing.
+            logger.warning(
+                "HDBSCAN Layer 1 failed for super-category '%s' (%d segments): %s. "
+                "Collapsing into a single sub-category.",
+                sc.name, len(l0_indices), exc,
+            )
+            sub_id = next_sub_id
+            next_sub_id += 1
+            member_segs = [segments[i] for i in l0_indices]
+            centroid = _single_centroid(l0_embs)
+            name = _name_from_members(member_segs, l0_embs, centroid)
+            platforms = set(s.platform for s in member_segs)
+            sub_categories.append(SubCategory(
+                id=sub_id, name=name, parent_id=sc.id,
+                segment_ids=[s.id for s in member_segs],
+                centroid=centroid, platforms=platforms,
+                member_count=len(member_segs),
+            ))
+            sc.subcategory_ids.append(sub_id)
+            for idx in l0_indices:
+                l1_labels[idx] = sub_id
+            continue
 
         n_found = len(set(local_labels_raw)) - (1 if -1 in local_labels_raw else 0)
         if n_found == 0:

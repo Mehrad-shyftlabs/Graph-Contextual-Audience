@@ -1,8 +1,15 @@
-"""Qdrant vector database operations — collection creation, ingestion, and query helpers."""
+"""Qdrant vector database operations — collection creation, ingestion, and query helpers.
+
+Supports blue/green deployment: the build pipeline creates versioned collections
+(e.g. ``supercategories_v2``), ingests data, and atomically swaps aliases so the
+API transparently serves from the new data.  The previous version is kept for
+instant rollback.
+"""
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import numpy as np
@@ -20,6 +27,7 @@ from qdrant_client.models import (
 )
 
 from audience_targeting.models import Segment, SubCategory, SuperCategory
+from audience_targeting.retry import with_retry
 from audience_targeting.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -28,6 +36,7 @@ logger = logging.getLogger(__name__)
 # ── Collection creation ──────────────────────────────────────────────────
 
 
+@with_retry()
 def create_collections(client: QdrantClient, settings: Settings) -> None:
     """Create (or recreate) the 3 Qdrant collections with payload indexes."""
 
@@ -78,6 +87,134 @@ def _create_payload_indexes(client: QdrantClient, settings: Settings) -> None:
         )
 
 
+# ── Blue / green deployment ──────────────────────────────────────────────
+
+_BASE_COLLECTIONS = ("supercategories", "subcategories", "segments")
+
+
+def _versioned_name(base: str, settings: Settings) -> str:
+    """Return a timestamped collection name, e.g. ``supercategories_v1713370800``."""
+    ts = int(time.time())
+    prefix = settings.qdrant_collection_prefix
+    if prefix:
+        return f"{prefix}_{base}_v{ts}"
+    return f"{base}_v{ts}"
+
+
+def create_versioned_collections(client: QdrantClient, settings: Settings) -> dict[str, str]:
+    """Create new timestamped collections for a blue/green deploy.
+
+    Returns a mapping ``{alias_name: versioned_collection_name}`` so the caller
+    can ingest into the versioned names, then call ``swap_aliases`` to go live.
+    """
+    mapping: dict[str, str] = {}
+
+    for base in _BASE_COLLECTIONS:
+        alias = settings.collection_name(base)
+        versioned = _versioned_name(base, settings)
+
+        vectors: dict[str, VectorParams] = {
+            "bge": VectorParams(size=settings.embedding_dim, distance=Distance.COSINE),
+        }
+        if settings.use_node2vec and base != "supercategories":
+            vectors["node2vec"] = VectorParams(size=settings.node2vec_dim, distance=Distance.COSINE)
+
+        client.create_collection(
+            collection_name=versioned,
+            vectors_config=vectors,
+        )
+        mapping[alias] = versioned
+
+    # Create payload indexes on the versioned collections
+    _create_payload_indexes_on(client, mapping, settings)
+    logger.info("Created versioned collections: %s", mapping)
+    return mapping
+
+
+def _create_payload_indexes_on(
+    client: QdrantClient,
+    mapping: dict[str, str],
+    settings: Settings,
+) -> None:
+    """Create payload indexes on the versioned collection names."""
+    super_coll = mapping[settings.collection_name("supercategories")]
+    sub_coll = mapping[settings.collection_name("subcategories")]
+    seg_coll = mapping[settings.collection_name("segments")]
+
+    client.create_payload_index(super_coll, "super_id", PayloadSchemaType.INTEGER)
+    for field in ["parent_super_id", "sub_id"]:
+        client.create_payload_index(sub_coll, field, PayloadSchemaType.INTEGER)
+    for field in ["subcategory_id", "super_category_id", "platform", "segment_id"]:
+        schema = (
+            PayloadSchemaType.KEYWORD
+            if field in ("platform", "segment_id")
+            else PayloadSchemaType.INTEGER
+        )
+        client.create_payload_index(seg_coll, field, schema)
+
+
+@with_retry()
+def swap_aliases(
+    client: QdrantClient,
+    mapping: dict[str, str],
+    settings: Settings,
+    delete_previous: bool = False,
+) -> None:
+    """Atomically swap aliases so the API points at new versioned collections.
+
+    Each alias (e.g. ``supercategories``) is pointed at the corresponding
+    versioned collection (e.g. ``supercategories_v1713370800``).
+
+    Parameters
+    ----------
+    mapping
+        ``{alias_name: new_versioned_collection_name}``
+    delete_previous
+        If True, delete the collections that the aliases *previously*
+        pointed at.  Default is False (keep for rollback).
+    """
+    from qdrant_client.models import (
+        CreateAliasOperation,
+        AliasOperations,
+        CreateAlias,
+    )
+
+    # Discover which collections the aliases currently point to (for cleanup).
+    previous_collections: list[str] = []
+    try:
+        existing = client.get_aliases()
+        for alias_desc in existing.aliases:
+            if alias_desc.alias_name in mapping:
+                previous_collections.append(alias_desc.collection_name)
+    except Exception:
+        pass  # First deploy — no existing aliases.
+
+    # Build atomic alias swap operations.
+    operations = [
+        CreateAliasOperation(
+            create_alias=CreateAlias(
+                alias_name=alias,
+                collection_name=collection,
+            )
+        )
+        for alias, collection in mapping.items()
+    ]
+
+    client.update_collection_aliases(
+        change_aliases_operations=operations,
+    )
+    logger.info("Aliases swapped: %s", {a: c for a, c in mapping.items()})
+
+    if delete_previous:
+        for prev in previous_collections:
+            if prev not in mapping.values():
+                try:
+                    client.delete_collection(prev)
+                    logger.info("Deleted previous collection: %s", prev)
+                except Exception as exc:
+                    logger.warning("Failed to delete previous collection %s: %s", prev, exc)
+
+
 # ── Ingestion ────────────────────────────────────────────────────────────
 
 
@@ -92,6 +229,7 @@ def _py(val):
     return val
 
 
+@with_retry()
 def ingest_supercategories(
     client: QdrantClient,
     super_categories: list[SuperCategory],
@@ -119,6 +257,7 @@ def ingest_supercategories(
     logger.info(f"Ingested {len(points)} super-categories")
 
 
+@with_retry()
 def ingest_subcategories(
     client: QdrantClient,
     sub_categories: list[SubCategory],
@@ -168,6 +307,7 @@ def ingest_subcategories(
     logger.info(f"Ingested {len(points)} sub-categories")
 
 
+@with_retry(max_retries=5, base_delay=0.5)
 def ingest_segments(
     client: QdrantClient,
     segments: list[Segment],
@@ -232,6 +372,7 @@ def ingest_segments(
 # ── Search helpers ───────────────────────────────────────────────────────
 
 
+@with_retry()
 def search_supercategories(
     client: QdrantClient,
     query_vector: list[float],
@@ -248,6 +389,7 @@ def search_supercategories(
     return [{"score": r.score, **r.payload} for r in results]
 
 
+@with_retry()
 def search_subcategories(
     client: QdrantClient,
     query_vector: list[float],
@@ -274,6 +416,7 @@ def search_subcategories(
     return out
 
 
+@with_retry()
 def search_segments(
     client: QdrantClient,
     query_vector: list[float],
@@ -309,6 +452,7 @@ def search_segments(
     return out
 
 
+@with_retry()
 def get_related_subcategories(
     client: QdrantClient,
     centroid_vector: list[float],
@@ -344,6 +488,7 @@ def get_related_subcategories(
     return related
 
 
+@with_retry()
 def get_siblings(
     client: QdrantClient,
     parent_super_id: int,
@@ -374,6 +519,7 @@ def get_siblings(
     return out
 
 
+@with_retry()
 def get_segment_equivalents(
     client: QdrantClient,
     segment_vector: list[float],
